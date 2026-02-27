@@ -7,10 +7,11 @@ const API_ORIGIN = typeof window !== 'undefined'
 export default function App() {
   const [tvMode, setTvMode] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
-  const [authSubmitting, setAuthSubmitting] = useState(false);
-  const [authUser, setAuthUser] = useState(null);
   const [authError, setAuthError] = useState('');
-  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [currentUser, setCurrentUser] = useState(null);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
 
   const [screenDataValues, setScreenDataValues] = useState({
     turbidity: null,
@@ -33,7 +34,8 @@ export default function App() {
     currentOperator: null,
     reservedMetric: null,
     targetHour: null,
-    fetchedAt: null
+    fetchedAt: null,
+    scrapeError: null
   });
   const [screenDataLoading, setScreenDataLoading] = useState(false);
   const [screenDataError, setScreenDataError] = useState('');
@@ -44,6 +46,23 @@ export default function App() {
   const [lastActiveDosingDateDraft, setLastActiveDosingDateDraft] = useState('');
   const [lastActiveDosingHourDraft, setLastActiveDosingHourDraft] = useState('');
   const [lastActiveDosingSaving, setLastActiveDosingSaving] = useState(false);
+  const [showHistoricalData, setShowHistoricalData] = useState(false);
+  const [historyDate, setHistoryDate] = useState('');
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historyGroups, setHistoryGroups] = useState([]);
+  const [missingHistoryLoading, setMissingHistoryLoading] = useState(false);
+  const [missingHistoryError, setMissingHistoryError] = useState('');
+  const [missingHistoryGroups, setMissingHistoryGroups] = useState([]);
+  const [missingHistoryTotal, setMissingHistoryTotal] = useState(0);
+  const [missingHistoryScanned, setMissingHistoryScanned] = useState(false);
+  const [missingEntryDrafts, setMissingEntryDrafts] = useState({});
+  const [missingSaveLoading, setMissingSaveLoading] = useState(false);
+  const [missingSaveError, setMissingSaveError] = useState('');
+  const [missingSaveMessage, setMissingSaveMessage] = useState('');
+  const [historicalFullscreen, setHistoricalFullscreen] = useState(false);
+
+  const canEditScreenData = Boolean(currentUser?.sectionAccess?.['screen-data']?.edit);
 
   const TURBIDITY_SCREEN_OVERRIDE = {
     '1 PM': 1.73,
@@ -53,24 +72,65 @@ export default function App() {
   };
 
   const fetchCurrentUser = async () => {
+    const response = await fetch(`${API_ORIGIN}/api/auth/me`, { credentials: 'include' });
+    const payload = await response.json();
+    if (!response.ok) {
+      if (response.status === 401) return null;
+      throw new Error(payload.error || 'Failed to fetch user profile');
+    }
+    return payload.user || null;
+  };
+
+  const handleLogin = async (event) => {
+    event.preventDefault();
+    setAuthError('');
+
+    const username = loginUsername.trim();
+    const password = loginPassword;
+
+    if (!username || !password) {
+      setAuthError('Username and password are required.');
+      return;
+    }
+
     try {
-      const response = await fetch(`${API_ORIGIN}/api/auth/me`, { credentials: 'include' });
-      if (!response.ok) {
-        setAuthUser(null);
-        return;
-      }
+      setLoginLoading(true);
+      const response = await fetch(`${API_ORIGIN}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include',
+        body: JSON.stringify({ username, password })
+      });
       const payload = await response.json();
-      setAuthUser(payload.user || null);
-    } catch {
-      setAuthUser(null);
+
+      if (!response.ok) {
+        throw new Error(payload.error || 'Invalid username or password');
+      }
+
+      setCurrentUser(payload.user || null);
+      setLoginPassword('');
+    } catch (error) {
+      setAuthError(error.message || 'Login failed');
     } finally {
-      setAuthLoading(false);
+      setLoginLoading(false);
     }
   };
 
-  useEffect(() => {
-    fetchCurrentUser();
-  }, []);
+  const handleLogout = async () => {
+    try {
+      await fetch(`${API_ORIGIN}/api/auth/logout`, {
+        method: 'POST',
+        credentials: 'include'
+      });
+    } catch (_) {
+      // ignore network logout errors and clear local state
+    }
+    setCurrentUser(null);
+    setShowHistoricalData(false);
+    setLoginPassword('');
+  };
 
   const fetchScreenData = async () => {
     setScreenDataLoading(true);
@@ -125,7 +185,8 @@ export default function App() {
         currentOperator: payload.current_operator,
         reservedMetric: payload.reserved_metric,
         targetHour: payload.target_hour,
-        fetchedAt: payload.fetched_at
+        fetchedAt: payload.fetched_at,
+        scrapeError: payload.scrape_error || null
       });
     } catch (error) {
       setScreenDataError(error.message || 'Failed to fetch screen data');
@@ -134,13 +195,187 @@ export default function App() {
     }
   };
 
+  const fetchHistoricalData = async () => {
+    setHistoryLoading(true);
+    setHistoryError('');
+
+    try {
+      const params = new URLSearchParams();
+      if (historyDate) {
+        params.set('start_date', historyDate);
+        params.set('end_date', historyDate);
+      }
+
+      const query = params.toString();
+      const endpoint = query
+        ? `${API_ORIGIN}/api/screen-data/history?${query}`
+        : `${API_ORIGIN}/api/screen-data/history`;
+
+      const response = await fetch(endpoint, { credentials: 'include' });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || 'Failed to fetch historical data');
+      }
+
+      setHistoryGroups(Array.isArray(payload) ? payload : []);
+    } catch (error) {
+      setHistoryError(error.message || 'Failed to fetch historical data');
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const scanMissingHistoricalData = async () => {
+    setMissingHistoryScanned(true);
+    setMissingHistoryLoading(true);
+    setMissingHistoryError('');
+    setMissingSaveError('');
+    setMissingSaveMessage('');
+
+    try {
+      const params = new URLSearchParams();
+      if (historyDate) {
+        params.set('start_date', historyDate);
+        params.set('end_date', historyDate);
+      }
+
+      const query = params.toString();
+      const endpoint = query
+        ? `${API_ORIGIN}/api/screen-data/history/missing-hours?${query}`
+        : `${API_ORIGIN}/api/screen-data/history/missing-hours`;
+
+      const response = await fetch(endpoint, { credentials: 'include' });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || 'Failed to scan missing entries');
+      }
+
+      const groups = Array.isArray(payload.groups) ? payload.groups : [];
+      setMissingHistoryGroups(groups);
+      setMissingHistoryTotal(Number(payload.totalMissingHours) || 0);
+
+      const nextDrafts = {};
+      groups.forEach((group) => {
+        (group.entries || []).forEach((entry) => {
+          const key = entry.slotDatetime;
+          nextDrafts[key] = {
+            damLevel: entry.damLevel === null || entry.damLevel === undefined ? '' : String(entry.damLevel),
+            turbidity: entry.turbidity === null || entry.turbidity === undefined ? '' : String(entry.turbidity)
+          };
+        });
+      });
+      setMissingEntryDrafts(nextDrafts);
+    } catch (error) {
+      setMissingHistoryError(error.message || 'Failed to scan missing entries');
+    } finally {
+      setMissingHistoryLoading(false);
+    }
+  };
+
+  const updateMissingEntryDraft = (slotDatetime, field, value) => {
+    setMissingEntryDrafts((prev) => ({
+      ...prev,
+      [slotDatetime]: {
+        ...(prev[slotDatetime] || { damLevel: '', turbidity: '' }),
+        [field]: value
+      }
+    }));
+  };
+
+  const saveMissingHistoricalEntries = async () => {
+    setMissingSaveError('');
+    setMissingSaveMessage('');
+
+    const entries = Object.entries(missingEntryDrafts)
+      .map(([slotDatetime, draft]) => {
+        const rawDamLevel = (draft?.damLevel ?? '').toString().trim();
+        const rawTurbidity = (draft?.turbidity ?? '').toString().trim();
+
+        const damLevel = rawDamLevel === '' ? null : Number(rawDamLevel);
+        const turbidity = rawTurbidity === '' ? null : Number(rawTurbidity);
+
+        if (damLevel !== null && Number.isNaN(damLevel)) return null;
+        if (turbidity !== null && Number.isNaN(turbidity)) return null;
+        if (damLevel === null && turbidity === null) return null;
+
+        return {
+          slotDatetime,
+          damLevel,
+          turbidity
+        };
+      })
+      .filter(Boolean);
+
+    if (entries.length === 0) {
+      setMissingSaveError('Please enter at least one value before saving.');
+      return;
+    }
+
+    const confirmed = typeof window !== 'undefined'
+      ? window.confirm('Are you sure you want to make these changes?')
+      : true;
+
+    if (!confirmed) return;
+
+    try {
+      setMissingSaveLoading(true);
+
+      const response = await fetch(`${API_ORIGIN}/api/screen-data/history/manual-entries`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include',
+        body: JSON.stringify({ entries })
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || 'Failed to save manual entries');
+      }
+
+      setMissingSaveMessage(payload.message || 'Manual entries saved.');
+      await fetchHistoricalData();
+      await scanMissingHistoricalData();
+    } catch (error) {
+      setMissingSaveError(error.message || 'Failed to save manual entries');
+    } finally {
+      setMissingSaveLoading(false);
+    }
+  };
+
   useEffect(() => {
-    if (!authUser) return;
+    let active = true;
+
+    const bootstrapAuth = async () => {
+      try {
+        setAuthLoading(true);
+        const user = await fetchCurrentUser();
+        if (!active) return;
+        setCurrentUser(user);
+      } catch (error) {
+        if (!active) return;
+        setAuthError(error.message || 'Failed to initialize authentication');
+      } finally {
+        if (active) setAuthLoading(false);
+      }
+    };
+
+    bootstrapAuth();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authLoading || !currentUser) return;
 
     fetchScreenData();
     const interval = setInterval(fetchScreenData, 15 * 60 * 1000);
     return () => clearInterval(interval);
-  }, [authUser]);
+  }, [authLoading, currentUser]);
 
   useEffect(() => {
     if (!tvMode) return;
@@ -151,6 +386,23 @@ export default function App() {
 
     return () => clearTimeout(refreshTimer);
   }, [tvMode]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (typeof document === 'undefined') return;
+      setHistoricalFullscreen(Boolean(document.fullscreenElement));
+    };
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('fullscreenchange', handleFullscreenChange);
+    }
+
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!tvMode) return;
@@ -176,41 +428,35 @@ export default function App() {
     };
   }, [tvMode]);
 
-  const handleLogin = async (event) => {
-    event.preventDefault();
-    if (authSubmitting) return;
-    setAuthSubmitting(true);
-    setAuthError('');
-
-    try {
-      const response = await fetch(`${API_ORIGIN}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify(loginForm)
-      });
-
-      const payload = await response.json();
-      if (!response.ok) {
-        setAuthError(payload.error || 'Login failed');
-        return;
-      }
-
-      setAuthUser(payload.user || null);
-      setLoginForm({ username: '', password: '' });
-    } catch (error) {
-      setAuthError(error.message || 'Login failed');
-    } finally {
-      setAuthSubmitting(false);
-    }
+  const openHistoricalData = async () => {
+    setTvMode(false);
+    setShowHistoricalData(true);
+    await fetchHistoricalData();
   };
 
-  const handleLogout = async () => {
+  const backToScreenData = () => {
+    if (typeof document !== 'undefined' && document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
+    setShowHistoricalData(false);
+    setHistoryError('');
+    setMissingHistoryError('');
+  };
+
+  const toggleHistoricalFullscreen = async () => {
+    if (typeof document === 'undefined') return;
+
     try {
-      await fetch(`${API_ORIGIN}/api/auth/logout`, { method: 'POST', credentials: 'include' });
-    } finally {
-      setAuthUser(null);
-      setTvMode(false);
+      if (!document.fullscreenElement) {
+        const container = document.getElementById('historical-data-panel');
+        if (container && container.requestFullscreen) {
+          await container.requestFullscreen();
+        }
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch (error) {
+      setHistoryError('Unable to change fullscreen mode.');
     }
   };
 
@@ -380,7 +626,9 @@ export default function App() {
     return card.formatter(card.value);
   };
 
-  const connectionStatus = screenDataError ? 'Disconnected' : 'Connected';
+  const connectionStatus = screenDataLoading && !screenDataValues.fetchedAt
+    ? 'Checking...'
+    : (screenDataValues.scrapeError ? 'Not connected' : 'Connected');
 
   const formatDamLevelMetric = (value) => {
     if (value === null || value === undefined || value === '') {
@@ -580,81 +828,256 @@ export default function App() {
   };
 
   if (authLoading) {
-    return <div className="min-h-screen bg-blue-50 flex items-center justify-center text-gray-700">Checking session...</div>;
-  }
-
-  if (!authUser) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-blue-100 flex items-center justify-center px-4">
-        <form onSubmit={handleLogin} className="w-full max-w-md bg-white rounded-xl shadow-xl p-8 space-y-4 border border-blue-100">
-          <h1 className="text-2xl font-bold text-gray-900">Screen Data Login</h1>
-          <input
-            value={loginForm.username}
-            onChange={(e) => setLoginForm((prev) => ({ ...prev, username: e.target.value }))}
-            type="text"
-            placeholder="Username"
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-          />
-          <input
-            value={loginForm.password}
-            onChange={(e) => setLoginForm((prev) => ({ ...prev, password: e.target.value }))}
-            type="password"
-            placeholder="Password"
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-          />
-          {authError && <p className="text-sm text-red-600">{authError}</p>}
-          <button
-            type="submit"
-            disabled={authSubmitting}
-            className="w-full px-4 py-2 rounded-lg bg-blue-700 text-white font-semibold hover:bg-blue-800 disabled:opacity-60"
-          >
-            {authSubmitting ? 'Signing in...' : 'Sign in'}
-          </button>
-        </form>
+        <div className="bg-white rounded-xl shadow-xl border-2 border-blue-100 p-8 w-full max-w-md">
+          <h1 className="text-2xl font-bold text-gray-900 text-center">Water Quality Division</h1>
+          <p className="mt-4 text-center text-gray-600 font-semibold">Checking authentication...</p>
+        </div>
       </div>
     );
   }
 
-  const canViewScreenData = Boolean(authUser?.sectionAccess?.['screen-data']?.view);
-  if (!canViewScreenData) {
+  if (!currentUser) {
     return (
-      <div className="min-h-screen bg-blue-50 flex flex-col items-center justify-center gap-4">
-        <p className="text-xl font-semibold text-gray-800">Your account has no access to Screen Data.</p>
-        <button onClick={handleLogout} className="px-4 py-2 rounded-lg bg-blue-700 text-white font-semibold hover:bg-blue-800">Sign out</button>
+      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-blue-100 flex items-center justify-center px-4">
+        <div className="bg-white rounded-xl shadow-xl border-2 border-blue-100 p-8 w-full max-w-md">
+          <h1 className="text-2xl font-bold text-gray-900 text-center">Sign in</h1>
+          <p className="mt-2 text-center text-gray-600">Water Quality Division Data Management System</p>
+          <form className="mt-6 space-y-4" onSubmit={handleLogin}>
+            <input
+              type="text"
+              value={loginUsername}
+              onChange={(e) => setLoginUsername(e.target.value)}
+              placeholder="Username"
+              className="w-full px-4 py-3 rounded-lg border border-blue-300 text-gray-800"
+              autoComplete="username"
+            />
+            <input
+              type="password"
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              placeholder="Password"
+              className="w-full px-4 py-3 rounded-lg border border-blue-300 text-gray-800"
+              autoComplete="current-password"
+            />
+            {authError && <div className="text-red-600 text-sm font-semibold">{authError}</div>}
+            <button
+              type="submit"
+              disabled={loginLoading}
+              className="w-full px-4 py-3 rounded-lg font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60"
+            >
+              {loginLoading ? 'Signing in...' : 'Sign In'}
+            </button>
+          </form>
+        </div>
       </div>
     );
   }
 
   return (
     <div className={`min-h-screen ${tvMode ? 'bg-slate-100' : 'bg-gradient-to-br from-blue-50 to-blue-100'}`}>
-      <div className="print-hide bg-white shadow-lg border-b border-blue-200">
-        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
-          <h1 className="text-lg font-semibold text-gray-900">Water Quality Division Data Management System</h1>
-          {!tvMode && (
-            <button onClick={handleLogout} className="px-4 py-2 rounded-lg bg-blue-700 text-white font-semibold hover:bg-blue-800">Sign out</button>
-          )}
+      {!tvMode && (
+        <div className="print-hide bg-white shadow-lg border-b border-blue-200">
+          <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+            <h1 className="text-lg font-semibold text-gray-900">Water Quality Division Data Management System</h1>
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-gray-700 font-semibold">{currentUser.username} ({currentUser.role})</span>
+              <button
+                onClick={handleLogout}
+                className="px-3 py-2 rounded-lg text-sm font-semibold text-white bg-slate-700 hover:bg-slate-800"
+              >
+                Sign Out
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
 
       <main className={tvMode ? 'w-screen h-screen overflow-hidden px-5 py-5' : 'container mx-auto px-4 py-8'}>
         <div className={tvMode ? 'h-full flex flex-col gap-3' : 'space-y-6'}>
           <div className={`flex items-center gap-4 ${tvMode ? 'justify-center' : 'justify-between'}`}>
             <h2 className={`${tvMode ? 'text-3xl lg:text-4xl' : 'text-4xl'} font-extrabold text-gray-900 tracking-wide`}>
-              {tvMode ? 'WATER QUALITY DIVISION' : 'SCREEN DATA'}
+              {tvMode ? 'WATER QUALITY DIVISION' : showHistoricalData ? 'HISTORICAL DATA' : 'SCREEN DATA'}
             </h2>
             {!tvMode && (
-              <button
-                onClick={() => setTvMode(true)}
-                className="px-5 py-3 rounded-lg font-semibold text-white bg-blue-700 hover:bg-blue-800">
-                Enter TV Mode
-              </button>
+              <div className="flex gap-2">
+                {!showHistoricalData && (
+                  <button
+                    onClick={() => setTvMode(true)}
+                    className="px-5 py-3 rounded-lg font-semibold text-white bg-blue-700 hover:bg-blue-800">
+                    Enter TV Mode
+                  </button>
+                )}
+                {!showHistoricalData ? (
+                  <button
+                    onClick={openHistoricalData}
+                    className="px-5 py-3 rounded-lg font-semibold text-white bg-slate-700 hover:bg-slate-800">
+                    Show Historical Data
+                  </button>
+                ) : (
+                  <button
+                    onClick={backToScreenData}
+                    className="px-5 py-3 rounded-lg font-semibold text-white bg-slate-700 hover:bg-slate-800">
+                    Back to Screen Data
+                  </button>
+                )}
+              </div>
             )}
           </div>
           <div className={`flex flex-wrap items-center ${tvMode ? 'gap-2 text-sm lg:text-base' : 'gap-4 text-base'} text-gray-700`}>
             <span className="font-semibold">Last Updated: {screenDataValues.fetchedAt ? new Date(screenDataValues.fetchedAt).toLocaleString() : '--'}</span>
-            <span className="font-semibold">Connection: {connectionStatus}</span>
-            {screenDataError && <span className="text-red-600 font-semibold">{screenDataError}</span>}
+            {!showHistoricalData && <span className="font-semibold">Connection: {connectionStatus}</span>}
+            {screenDataError && !showHistoricalData && <span className="text-red-600 font-semibold">{screenDataError}</span>}
           </div>
+          {showHistoricalData && !tvMode ? (
+            <div id="historical-data-panel" className={`bg-white p-8 rounded-xl shadow-xl border-2 border-blue-100 space-y-4 ${historicalFullscreen ? 'h-full overflow-auto' : ''}`}>
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                <button
+                  onClick={toggleHistoricalFullscreen}
+                  className="px-3 py-2 rounded-lg text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 w-full md:w-auto md:justify-self-start"
+                >
+                  {historicalFullscreen ? 'Exit Full Screen Data' : 'Show Full Screen Data'}
+                </button>
+                <input
+                  type="date"
+                  value={historyDate}
+                  onChange={(e) => {
+                    setHistoryDate(e.target.value);
+                    setMissingHistoryScanned(false);
+                    setMissingHistoryError('');
+                    setMissingHistoryGroups([]);
+                    setMissingHistoryTotal(0);
+                    setMissingEntryDrafts({});
+                    setMissingSaveError('');
+                    setMissingSaveMessage('');
+                  }}
+                  className="px-3 py-2 rounded border-2 border-blue-300 text-gray-800 font-semibold"
+                />
+                <button
+                  onClick={fetchHistoricalData}
+                  disabled={historyLoading}
+                  className="px-5 py-2 rounded-lg font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60"
+                >
+                  {historyLoading ? 'Loading...' : 'Load Results'}
+                </button>
+                {canEditScreenData && (
+                  <button
+                    onClick={scanMissingHistoricalData}
+                    disabled={missingHistoryLoading}
+                    className="px-5 py-2 rounded-lg font-semibold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-60"
+                  >
+                    {missingHistoryLoading ? 'Scanning...' : 'Scan Missing Entries'}
+                  </button>
+                )}
+              </div>
+
+              {historyError && <div className="text-red-600 font-semibold">{historyError}</div>}
+              {missingHistoryError && <div className="text-red-600 font-semibold">{missingHistoryError}</div>}
+              {missingSaveError && <div className="text-red-600 font-semibold">{missingSaveError}</div>}
+              {missingSaveMessage && <div className="text-green-700 font-semibold">{missingSaveMessage}</div>}
+
+              {canEditScreenData && (missingHistoryGroups.length > 0 || (!missingHistoryLoading && missingHistoryTotal > 0)) && (
+                <div className="border border-amber-200 rounded-lg overflow-hidden">
+                  <div className="bg-amber-50 px-4 py-2 font-bold text-amber-900">
+                    Missing Entries Scan Result: {missingHistoryTotal} hour(s)
+                  </div>
+                  <div className="p-4 space-y-4">
+                    {missingHistoryGroups.map((group) => (
+                      <div key={group.date} className="text-sm text-gray-800 border border-amber-100 rounded-md overflow-hidden">
+                        <p className="font-semibold text-gray-900 bg-amber-50 px-3 py-2">{group.date}</p>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead className="bg-amber-100 text-gray-800">
+                              <tr>
+                                <th className="text-left px-3 py-2">Time</th>
+                                <th className="text-left px-3 py-2">Dam Level</th>
+                                <th className="text-left px-3 py-2">Turbidity</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(group.entries || []).map((entry) => {
+                                const draft = missingEntryDrafts[entry.slotDatetime] || { damLevel: '', turbidity: '' };
+                                return (
+                                  <tr key={entry.slotDatetime} className="border-t border-amber-100">
+                                    <td className="px-3 py-2 font-medium">{entry.time}</td>
+                                    <td className="px-3 py-2">
+                                      <input
+                                        type="number"
+                                        step="0.01"
+                                        value={draft.damLevel}
+                                        onChange={(e) => updateMissingEntryDraft(entry.slotDatetime, 'damLevel', e.target.value)}
+                                        className="w-full md:w-36 px-2 py-1 rounded border border-amber-300"
+                                        placeholder="Dam level"
+                                      />
+                                    </td>
+                                    <td className="px-3 py-2">
+                                      <input
+                                        type="number"
+                                        step="0.01"
+                                        value={draft.turbidity}
+                                        onChange={(e) => updateMissingEntryDraft(entry.slotDatetime, 'turbidity', e.target.value)}
+                                        className="w-full md:w-36 px-2 py-1 rounded border border-amber-300"
+                                        placeholder="Turbidity"
+                                      />
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
+
+                    <div className="flex justify-end">
+                      <button
+                        onClick={saveMissingHistoricalEntries}
+                        disabled={missingSaveLoading}
+                        className="px-5 py-2 rounded-lg font-semibold text-white bg-green-700 hover:bg-green-800 disabled:opacity-60"
+                      >
+                        {missingSaveLoading ? 'Saving...' : 'Save Manual Entries'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {canEditScreenData && missingHistoryScanned && !missingHistoryLoading && missingHistoryGroups.length === 0 && missingHistoryTotal === 0 && (
+                <div className="text-gray-700 text-sm">Scan result: no missing entries found for the selected range.</div>
+              )}
+
+              {historyGroups.length === 0 && !historyLoading ? (
+                <div className="text-gray-700 font-semibold">No historical records found.</div>
+              ) : (
+                historyGroups.map((group) => (
+                  <div key={group.date} className="border border-blue-200 rounded-lg overflow-hidden">
+                    <div className="bg-blue-50 px-4 py-2 font-bold text-blue-900">{group.date}</div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead className="bg-blue-100 text-gray-800">
+                          <tr>
+                            <th className="text-left px-4 py-2">Time</th>
+                            <th className="text-left px-4 py-2">Dam Level (m)</th>
+                            <th className="text-left px-4 py-2">Turbidity (NTU)</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(group.entries || []).map((entry) => (
+                            <tr key={entry.slotDatetime} className="border-t border-blue-100">
+                              <td className="px-4 py-2">{entry.time || '--'}</td>
+                              <td className="px-4 py-2">{entry.damLevel === null || entry.damLevel === undefined ? '--' : Number(entry.damLevel).toFixed(2)}</td>
+                              <td className="px-4 py-2">{entry.turbidity === null || entry.turbidity === undefined ? '--' : Number(entry.turbidity).toFixed(2)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          ) : (
           <div className={`${tvMode ? 'flex-1' : ''} bg-white ${tvMode ? 'p-4' : 'p-8'} rounded-xl shadow-xl border-2 border-blue-100`}>
             <div className={tvMode ? 'grid h-full grid-cols-4 grid-rows-2 gap-3' : 'grid grid-cols-2 lg:grid-cols-4 gap-6'}>
               {screenDataCards.map((card) => (
@@ -670,7 +1093,7 @@ export default function App() {
                     <div
                       key={card.label}
                       className={`group relative border-2 border-blue-300 rounded-xl ${tvMode ? 'p-4 min-h-0' : 'p-6 min-h-[200px]'} bg-gradient-to-br from-blue-50 to-sky-100 flex flex-col`}>
-                      {(isChlorineCard || isLastActiveDosingCard) && !tvMode && !isEditingCard && (
+                      {(isChlorineCard || isLastActiveDosingCard) && canEditScreenData && !tvMode && !isEditingCard && (
                         <button
                           type="button"
                           onClick={isChlorineCard ? startEditChlorineDate : startEditLastActiveDosing}
@@ -830,6 +1253,7 @@ export default function App() {
               ))}
             </div>
           </div>
+          )}
         </div>
       </main>
 

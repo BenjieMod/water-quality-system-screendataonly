@@ -1,5 +1,6 @@
 import openpyxl
 import asyncio
+from collections import defaultdict
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 import os
@@ -98,6 +99,14 @@ ROLE_PERMISSIONS = {
         'view_micro',
         'view_water_treatment',
         'view_screen_data'
+    },
+    'viewonly': {
+        'view_physchem',
+        'view_micro',
+        'view_water_treatment',
+        'view_leave',
+        'view_screen_data',
+        'view_foi'
     }
 }
 
@@ -164,67 +173,61 @@ def _get_current_user():
     return user
 
 
-def _required_permissions_for_request(path: str, method: str):
-    normalized_method = method.upper()
+def _get_effective_user():
+    user = _get_current_user()
+    if user:
+        return user
 
-    if not path.startswith('/api/'):
-        return []
-    if path.startswith('/api/auth/'):
-        return []
-    if path == '/api/health':
-        return []
+    fallback_admin = AppUser.query.filter_by(is_active=True, role='admin').order_by(AppUser.id.asc()).first()
+    if fallback_admin:
+        return fallback_admin
 
-    if path.startswith('/api/physchem'):
-        return ['view_physchem'] if normalized_method == 'GET' else ['edit_physchem']
-    if path.startswith('/api/micro'):
-        return ['view_micro'] if normalized_method == 'GET' else ['edit_micro']
-    if path.startswith('/api/water-treatment'):
-        return ['view_water_treatment'] if normalized_method == 'GET' else ['edit_water_treatment']
-    if path.startswith('/api/screen-data'):
-        return ['view_screen_data'] if normalized_method == 'GET' else ['edit_screen_data']
-    if path.startswith('/api/employees') or path.startswith('/api/cto-applications') or path.startswith('/api/leave-applications') or path.startswith('/api/leave-credits'):
-        return ['view_leave'] if normalized_method == 'GET' else ['edit_leave']
-    if path.startswith('/api/next-file-number'):
-        return ['view_physchem', 'view_micro']
-    if path.startswith('/api/increment-file-number'):
-        return ['edit_physchem', 'edit_micro']
+    return AppUser.query.filter_by(is_active=True).order_by(AppUser.id.asc()).first()
 
-    return []
+
+def _is_auth_required() -> bool:
+    return bool(app.config.get('APP_AUTH_REQUIRED', False))
+
+
+def _require_permission(permission_name: str):
+    if not _is_auth_required():
+        return None
+
+    current_user = g.get('current_user') or _get_current_user()
+    if not current_user:
+        return jsonify({'error': 'Authentication required'}), 401
+
+    permissions = _get_permissions_for_role(current_user.role)
+    if permission_name not in permissions:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    return None
 
 
 @app.before_request
 def enforce_api_authentication():
+    current_user = _get_current_user() if _is_auth_required() else _get_effective_user()
+    g.current_user = current_user
+
+    if not _is_auth_required():
+        return None
+
     if request.method == 'OPTIONS':
         return None
 
     if not request.path.startswith('/api/'):
         return None
 
-    if request.path.startswith('/api/auth/login'):
+    public_paths = {
+        '/api/health',
+        '/api/auth/login'
+    }
+    if request.path in public_paths:
         return None
 
-    user = _get_current_user()
-    if request.path.startswith('/api/auth/'):
-        if not user:
-            return jsonify({'error': 'Authentication required'}), 401
-        g.current_user = user
-        return None
-
-    required_permissions = _required_permissions_for_request(request.path, request.method)
-    if not required_permissions:
-        if not user:
-            return jsonify({'error': 'Authentication required'}), 401
-        g.current_user = user
-        return None
-
-    if not user:
+    if not current_user:
         return jsonify({'error': 'Authentication required'}), 401
 
-    permissions = _get_permissions_for_role(user.role)
-    if not any(permission in permissions for permission in required_permissions):
-        return jsonify({'error': 'Insufficient privileges'}), 403
-
-    g.current_user = user
     return None
 
 
@@ -278,8 +281,6 @@ def _persist_and_get_recent_dam_snapshots(slot_datetime: datetime, target_hour_l
                     dam_level=float(dam_level)
                 ))
 
-        cutoff_datetime = slot_datetime - timedelta(hours=3)
-        DamLevelSnapshot.query.filter(DamLevelSnapshot.slot_datetime < cutoff_datetime).delete(synchronize_session=False)
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -302,8 +303,6 @@ def _persist_and_get_recent_turbidity_snapshots(slot_datetime: datetime, target_
                     turbidity=float(turbidity)
                 ))
 
-        cutoff_datetime = slot_datetime - timedelta(hours=3)
-        TurbiditySnapshot.query.filter(TurbiditySnapshot.slot_datetime < cutoff_datetime).delete(synchronize_session=False)
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -316,6 +315,294 @@ def _load_dam_history():
     payload = _load_dam_cache_payload()
     history = payload.get('history', []) if isinstance(payload, dict) else []
     return history if isinstance(history, list) else []
+
+
+def _build_screen_data_history(start_date: datetime = None, end_date: datetime = None):
+    dam_query = DamLevelSnapshot.query
+    turbidity_query = TurbiditySnapshot.query
+
+    if start_date:
+        dam_query = dam_query.filter(DamLevelSnapshot.slot_datetime >= start_date)
+        turbidity_query = turbidity_query.filter(TurbiditySnapshot.slot_datetime >= start_date)
+
+    if end_date:
+        dam_query = dam_query.filter(DamLevelSnapshot.slot_datetime < end_date)
+        turbidity_query = turbidity_query.filter(TurbiditySnapshot.slot_datetime < end_date)
+
+    dam_rows = dam_query.order_by(DamLevelSnapshot.slot_datetime.asc()).all()
+    turbidity_rows = turbidity_query.order_by(TurbiditySnapshot.slot_datetime.asc()).all()
+
+    merged_by_slot = {}
+
+    for row in dam_rows:
+        key = row.slot_datetime.isoformat()
+        merged_by_slot[key] = {
+            'slotDatetime': row.slot_datetime.isoformat(),
+            'date': row.slot_datetime.strftime('%Y-%m-%d'),
+            'time': row.slot_datetime.strftime('%I:%M %p').lstrip('0'),
+            'damLevel': float(row.dam_level) if row.dam_level is not None else None,
+            'turbidity': None
+        }
+
+    for row in turbidity_rows:
+        key = row.slot_datetime.isoformat()
+        entry = merged_by_slot.get(key)
+        if not entry:
+            entry = {
+                'slotDatetime': row.slot_datetime.isoformat(),
+                'date': row.slot_datetime.strftime('%Y-%m-%d'),
+                'time': row.slot_datetime.strftime('%I:%M %p').lstrip('0'),
+                'damLevel': None,
+                'turbidity': None
+            }
+            merged_by_slot[key] = entry
+
+        entry['turbidity'] = float(row.turbidity) if row.turbidity is not None else None
+
+    ordered_entries = sorted(merged_by_slot.values(), key=lambda item: item['slotDatetime'])
+    grouped = defaultdict(list)
+
+    for entry in ordered_entries:
+        grouped[entry['date']].append(entry)
+
+    return [
+        {
+            'date': date_key,
+            'entries': grouped[date_key]
+        }
+        for date_key in sorted(grouped.keys())
+    ]
+
+
+def _build_missing_screen_data_hours(start_date: datetime = None, end_date: datetime = None):
+    dam_query = DamLevelSnapshot.query
+    turbidity_query = TurbiditySnapshot.query
+
+    if start_date:
+        dam_query = dam_query.filter(DamLevelSnapshot.slot_datetime >= start_date)
+        turbidity_query = turbidity_query.filter(TurbiditySnapshot.slot_datetime >= start_date)
+
+    if end_date:
+        dam_query = dam_query.filter(DamLevelSnapshot.slot_datetime < end_date)
+        turbidity_query = turbidity_query.filter(TurbiditySnapshot.slot_datetime < end_date)
+
+    dam_rows = dam_query.order_by(DamLevelSnapshot.slot_datetime.asc()).all()
+    turbidity_rows = turbidity_query.order_by(TurbiditySnapshot.slot_datetime.asc()).all()
+
+    dam_by_slot = {}
+    turbidity_by_slot = {}
+
+    for row in dam_rows:
+        slot = row.slot_datetime.replace(minute=0, second=0, microsecond=0)
+        dam_by_slot[slot] = float(row.dam_level) if row.dam_level is not None else None
+
+    for row in turbidity_rows:
+        slot = row.slot_datetime.replace(minute=0, second=0, microsecond=0)
+        turbidity_by_slot[slot] = float(row.turbidity) if row.turbidity is not None else None
+
+    all_slots = sorted(set(list(dam_by_slot.keys()) + list(turbidity_by_slot.keys())))
+
+    if start_date is not None:
+        scan_start = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif all_slots:
+        first_slot = all_slots[0]
+        scan_start = first_slot.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        return {
+            'totalMissingHours': 0,
+            'groups': []
+        }
+
+    if end_date is not None:
+        scan_end = end_date
+    elif all_slots:
+        last_slot = all_slots[-1]
+        scan_end = last_slot.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    else:
+        scan_end = scan_start + timedelta(days=1)
+
+    grouped = defaultdict(list)
+    cursor = scan_start
+
+    while cursor < scan_end:
+        dam_value = dam_by_slot.get(cursor)
+        turbidity_value = turbidity_by_slot.get(cursor)
+
+        dam_missing = dam_value is None or dam_value == 0
+        turbidity_missing = turbidity_value is None or turbidity_value == 0
+
+        if dam_missing and turbidity_missing:
+            date_key = cursor.strftime('%Y-%m-%d')
+            grouped[date_key].append({
+                'slotDatetime': cursor.isoformat(),
+                'time': cursor.strftime('%I:%M %p').lstrip('0'),
+                'damLevel': dam_value,
+                'turbidity': turbidity_value
+            })
+
+        cursor += timedelta(hours=1)
+
+    groups = [
+        {
+            'date': date_key,
+            'entries': grouped[date_key]
+        }
+        for date_key in sorted(grouped.keys())
+    ]
+
+    return {
+        'totalMissingHours': sum(len(group['entries']) for group in groups),
+        'groups': groups
+    }
+
+
+def _upsert_manual_screen_data_entries(entries):
+    if not isinstance(entries, list):
+        raise ValueError('Entries must be an array.')
+
+    saved_count = 0
+
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+
+        slot_value = (item.get('slotDatetime') or '').strip()
+        if not slot_value:
+            continue
+
+        try:
+            slot_datetime = datetime.fromisoformat(slot_value)
+        except ValueError as exc:
+            raise ValueError(f'Invalid slotDatetime: {slot_value}') from exc
+
+        slot_datetime = slot_datetime.replace(minute=0, second=0, microsecond=0)
+
+        dam_level = item.get('damLevel')
+        turbidity = item.get('turbidity')
+
+        parsed_dam_level = None
+        parsed_turbidity = None
+
+        if dam_level is not None:
+            try:
+                parsed_dam_level = float(dam_level)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'Invalid damLevel value for {slot_value}') from exc
+
+        if turbidity is not None:
+            try:
+                parsed_turbidity = float(turbidity)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'Invalid turbidity value for {slot_value}') from exc
+
+        if parsed_dam_level is None and parsed_turbidity is None:
+            continue
+
+        hour = slot_datetime.strftime('%I').lstrip('0') or '0'
+        target_hour_label = f"{hour}:00 {slot_datetime.strftime('%p')}"
+
+        if parsed_dam_level is not None:
+            dam_row = DamLevelSnapshot.query.filter_by(slot_datetime=slot_datetime).first()
+            if dam_row:
+                dam_row.dam_level = parsed_dam_level
+                dam_row.target_hour = target_hour_label
+            else:
+                db.session.add(DamLevelSnapshot(
+                    slot_datetime=slot_datetime,
+                    target_hour=target_hour_label,
+                    dam_level=parsed_dam_level
+                ))
+
+        if parsed_turbidity is not None:
+            turbidity_row = TurbiditySnapshot.query.filter_by(slot_datetime=slot_datetime).first()
+            if turbidity_row:
+                turbidity_row.turbidity = parsed_turbidity
+                turbidity_row.target_hour = target_hour_label
+            else:
+                db.session.add(TurbiditySnapshot(
+                    slot_datetime=slot_datetime,
+                    target_hour=target_hour_label,
+                    turbidity=parsed_turbidity
+                ))
+
+        saved_count += 1
+
+    db.session.commit()
+    return saved_count
+
+
+def _get_treatment_activity_metrics(threshold: float = 5.0, reference_time: datetime = None):
+    now = reference_time or datetime.now()
+
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if month_start.month == 12:
+        next_month_start = month_start.replace(year=month_start.year + 1, month=1)
+    else:
+        next_month_start = month_start.replace(month=month_start.month + 1)
+
+    last_active_row = (
+        TurbiditySnapshot.query
+        .filter(
+            TurbiditySnapshot.turbidity.isnot(None),
+            TurbiditySnapshot.turbidity > threshold,
+            TurbiditySnapshot.slot_datetime <= now
+        )
+        .order_by(TurbiditySnapshot.slot_datetime.desc())
+        .first()
+    )
+
+    total_treatment_hours_month = (
+        TurbiditySnapshot.query
+        .filter(
+            TurbiditySnapshot.turbidity.isnot(None),
+            TurbiditySnapshot.turbidity > threshold,
+            TurbiditySnapshot.slot_datetime >= month_start,
+            TurbiditySnapshot.slot_datetime < next_month_start
+        )
+        .count()
+    )
+
+    last_active_treatment = None
+    if last_active_row and last_active_row.slot_datetime:
+        last_active_treatment = last_active_row.slot_datetime.strftime('%Y-%m-%d %H:%M')
+
+    return last_active_treatment, total_treatment_hours_month
+
+
+def _build_screen_data_fallback_payload(scrape_error: str = None):
+    computed_last_active_treatment, total_treatment_hours_month = _get_treatment_activity_metrics()
+    manual_last_active_treatment = _get_last_active_dosing()
+    last_active_treatment = manual_last_active_treatment or computed_last_active_treatment
+
+    payload = {
+        'target_hour': None,
+        'target_column': None,
+        'turbidity': None,
+        'previous_turbidity': None,
+        'turbidity_1_hour_prior': None,
+        'turbidity_2_hours_prior': None,
+        'turbidity_3_hours_prior': None,
+        'current_dam_level': None,
+        'previous_dam_level': None,
+        'dam_level_1_hour_prior': None,
+        'dam_level_2_hours_prior': None,
+        'dam_level_3_hours_prior': None,
+        'old_res_status': None,
+        'old_res_big_tank_level': None,
+        'tank_a_level': None,
+        'tank_b_level': None,
+        'tank_cd_level': None,
+        'current_operator': None,
+        'last_active_dosing': last_active_treatment,
+        'total_treatment_hours_month': total_treatment_hours_month,
+        'reserved_metric': _get_last_chlorine_tank_change(),
+        'fetched_at': datetime.now().isoformat()
+    }
+
+    if scrape_error:
+        payload['scrape_error'] = scrape_error
+
+    return payload
 
 
 def _load_dam_cache_payload():
@@ -676,6 +963,10 @@ async def _scrape_screen_data_live():
                 dam_cache_payload['last_displayed_fetched_at'] = datetime.now().isoformat()
                 _save_dam_cache_payload(dam_cache_payload)
 
+            computed_last_active_treatment, total_treatment_hours_month = _get_treatment_activity_metrics()
+            manual_last_active_treatment = _get_last_active_dosing()
+            last_active_treatment = manual_last_active_treatment or computed_last_active_treatment
+
             return {
                 'target_hour': target_hour_label,
                 'target_column': target_column,
@@ -695,8 +986,8 @@ async def _scrape_screen_data_live():
                 'tank_b_level': tank_b_level,
                 'tank_cd_level': tank_cd_level,
                 'current_operator': current_operator or None,
-                'last_active_dosing': dam_cache_payload.get('last_active_dosing'),
-                'total_treatment_hours_month': None,
+                'last_active_dosing': last_active_treatment,
+                'total_treatment_hours_month': total_treatment_hours_month,
                 'reserved_metric': dam_cache_payload.get('last_chlorine_tank_change'),
                 'fetched_at': datetime.now().isoformat()
             }
@@ -1366,17 +1657,25 @@ def auth_login():
     try:
         data = request.json or {}
         username = (data.get('username') or '').strip()
-        password = (data.get('password') or '').strip()
+        password = str(data.get('password') or '')
 
-        if not username or not password:
-            return jsonify({'error': 'Username and password are required'}), 400
+        if _is_auth_required():
+            if not username or not password:
+                return jsonify({'error': 'Username and password are required'}), 400
 
-        user = AppUser.query.filter_by(username=username).first()
-        if not user or not user.is_active or not check_password_hash(user.password_hash, password):
-            return jsonify({'error': 'Invalid username or password'}), 401
+            user = AppUser.query.filter_by(username=username, is_active=True).first()
+            if not user or not check_password_hash(user.password_hash, password):
+                return jsonify({'error': 'Invalid username or password'}), 401
+
+            session['user_id'] = user.id
+            return jsonify({'message': 'Login successful', 'user': _serialize_user(user)}), 200
+
+        user = AppUser.query.filter_by(username=username, is_active=True).first() if username else _get_effective_user()
+        if not user:
+            return jsonify({'error': 'No active user available'}), 404
 
         session['user_id'] = user.id
-        return jsonify({'message': 'Login successful', 'user': _serialize_user(user)}), 200
+        return jsonify({'message': 'Access granted', 'user': _serialize_user(user)}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
@@ -1389,18 +1688,19 @@ def auth_logout():
 
 @app.route('/api/auth/me', methods=['GET'])
 def auth_me():
-    user = _get_current_user()
+    user = _get_current_user() if _is_auth_required() else _get_effective_user()
     if not user:
-        return jsonify({'error': 'Authentication required'}), 401
+        if _is_auth_required():
+            return jsonify({'error': 'Authentication required'}), 401
+        return jsonify({'error': 'No active user available'}), 404
     return jsonify({'user': _serialize_user(user)}), 200
 
 
 @app.route('/api/auth/users', methods=['GET'])
 def list_auth_users():
-    user = _get_current_user()
-    permissions = _get_permissions_for_role(user.role)
-    if 'manage_users' not in permissions:
-        return jsonify({'error': 'Insufficient privileges'}), 403
+    permission_error = _require_permission('manage_users')
+    if permission_error:
+        return permission_error
 
     users = AppUser.query.order_by(AppUser.username.asc()).all()
     return jsonify([entry.to_dict() for entry in users]), 200
@@ -1408,10 +1708,9 @@ def list_auth_users():
 
 @app.route('/api/auth/users', methods=['POST'])
 def create_auth_user():
-    user = _get_current_user()
-    permissions = _get_permissions_for_role(user.role)
-    if 'manage_users' not in permissions:
-        return jsonify({'error': 'Insufficient privileges'}), 403
+    permission_error = _require_permission('manage_users')
+    if permission_error:
+        return permission_error
 
     try:
         data = request.json or {}
@@ -1443,10 +1742,9 @@ def create_auth_user():
 
 @app.route('/api/auth/users/<int:user_id>', methods=['PATCH'])
 def update_auth_user(user_id):
-    user = _get_current_user()
-    permissions = _get_permissions_for_role(user.role)
-    if 'manage_users' not in permissions:
-        return jsonify({'error': 'Insufficient privileges'}), 403
+    permission_error = _require_permission('manage_users')
+    if permission_error:
+        return permission_error
 
     target_user = AppUser.query.get_or_404(user_id)
     try:
@@ -1854,6 +2152,84 @@ def get_live_screen_data():
         return jsonify(payload), 200
     except Exception as e:
         app.logger.exception("Live screen data scrape failed")
+        fallback_payload = _build_screen_data_fallback_payload(str(e))
+        return jsonify(fallback_payload), 200
+
+
+@app.route('/api/screen-data/history', methods=['GET'])
+def get_screen_data_history():
+    try:
+        start_date_value = request.args.get('start_date')
+        end_date_value = request.args.get('end_date')
+
+        start_date = None
+        end_date = None
+
+        if start_date_value:
+            try:
+                start_date = datetime.strptime(start_date_value, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid start_date format. Use YYYY-MM-DD.'}), 400
+
+        if end_date_value:
+            try:
+                end_date = datetime.strptime(end_date_value, '%Y-%m-%d') + timedelta(days=1)
+            except ValueError:
+                return jsonify({'error': 'Invalid end_date format. Use YYYY-MM-DD.'}), 400
+
+        grouped_history = _build_screen_data_history(start_date=start_date, end_date=end_date)
+        return jsonify(grouped_history), 200
+    except Exception as e:
+        app.logger.exception('Failed to fetch screen data history')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/screen-data/history/missing-hours', methods=['GET'])
+def get_screen_data_missing_hours():
+    try:
+        start_date_value = request.args.get('start_date')
+        end_date_value = request.args.get('end_date')
+
+        start_date = None
+        end_date = None
+
+        if start_date_value:
+            try:
+                start_date = datetime.strptime(start_date_value, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid start_date format. Use YYYY-MM-DD.'}), 400
+
+        if end_date_value:
+            try:
+                end_date = datetime.strptime(end_date_value, '%Y-%m-%d') + timedelta(days=1)
+            except ValueError:
+                return jsonify({'error': 'Invalid end_date format. Use YYYY-MM-DD.'}), 400
+
+        payload = _build_missing_screen_data_hours(start_date=start_date, end_date=end_date)
+        return jsonify(payload), 200
+    except Exception as e:
+        app.logger.exception('Failed to scan missing screen data hours')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/screen-data/history/manual-entries', methods=['POST'])
+def save_screen_data_manual_entries():
+    permission_error = _require_permission('edit_screen_data')
+    if permission_error:
+        return permission_error
+
+    try:
+        payload = request.get_json(silent=True) or {}
+        entries = payload.get('entries')
+
+        saved_count = _upsert_manual_screen_data_entries(entries)
+        return jsonify({'message': f'Saved {saved_count} manual entr{("y" if saved_count == 1 else "ies")}.', 'savedCount': saved_count}), 200
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception('Failed to save manual screen data entries')
         return jsonify({'error': str(e)}), 500
 
 
@@ -1862,6 +2238,10 @@ def manage_last_chlorine_tank_change():
     try:
         if request.method == 'GET':
             return jsonify({'date': _get_last_chlorine_tank_change()}), 200
+
+        permission_error = _require_permission('edit_screen_data')
+        if permission_error:
+            return permission_error
 
         payload = request.get_json(silent=True) or {}
         date_value = (payload.get('date') or '').strip()
@@ -1880,6 +2260,10 @@ def manage_last_active_dosing():
     try:
         if request.method == 'GET':
             return jsonify({'value': _get_last_active_dosing()}), 200
+
+        permission_error = _require_permission('edit_screen_data')
+        if permission_error:
+            return permission_error
 
         payload = request.get_json(silent=True) or {}
         value = (payload.get('value') or '').strip()

@@ -8,6 +8,7 @@ class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
     SQLALCHEMY_DATABASE_URI = 'sqlite:///water_quality.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    APP_AUTH_REQUIRED = os.environ.get('APP_AUTH_REQUIRED', 'true').lower() == 'true'
     APP_DEFAULT_ADMIN_USERNAME = os.environ.get('APP_DEFAULT_ADMIN_USERNAME', 'admin')
     APP_DEFAULT_ADMIN_PASSWORD = os.environ.get('APP_DEFAULT_ADMIN_PASSWORD', 'admin123')
     APP_SESSION_COOKIE_SECURE = os.environ.get('APP_SESSION_COOKIE_SECURE', 'false').lower() == 'true'
