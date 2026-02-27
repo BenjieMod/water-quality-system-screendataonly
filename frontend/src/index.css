@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@media print {
+	.print-hide {
+		display: none !important;
+	}
+
+	.print-mode-physchem * {
+		visibility: hidden !important;
+	}
+
+	.print-mode-physchem [data-print-section='physchem-form'],
+	.print-mode-physchem [data-print-section='physchem-form'] * {
+		visibility: visible !important;
+	}
+
+	.print-mode-physchem [data-print-section='physchem-form'] {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		margin: 0;
+		border: 0 !important;
+		padding: 0 !important;
+		background: white !important;
+	}
+
+	.print-mode-micro * {
+		visibility: hidden !important;
+	}
+
+	.print-mode-micro [data-print-section='micro-form'],
+	.print-mode-micro [data-print-section='micro-form'] * {
+		visibility: visible !important;
+	}
+
+	.print-mode-micro [data-print-section='micro-form'] {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		margin: 0;
+		border: 0 !important;
+		padding: 0 !important;
+		background: white !important;
+	}
+}
