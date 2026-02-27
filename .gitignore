@@ -19,6 +19,7 @@ backend/instance/
 backend/uploads/
 backend/*.sqlite
 backend/*.db
+backend/app/instance/*.db
 backend/*.log
 backend/.env
 
